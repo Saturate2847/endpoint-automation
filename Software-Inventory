@@ -1,0 +1,279 @@
+#Requires -Version 5.1
+<#
+.SYNOPSIS
+    Exports an installed software inventory from one or more Windows endpoints.
+
+.DESCRIPTION
+    Collects installed software from the Windows registry on local or remote
+    machines, including both 32-bit and 64-bit application entries. Enriches
+    results with install date, version, publisher, and install location where
+    available.
+
+    Useful for software license auditing, vulnerability assessments (identifying
+    outdated software), unauthorized application detection, and asset management
+    documentation.
+
+    Queries three registry paths to ensure complete coverage:
+        HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall
+        HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall
+        HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall
+
+.PARAMETER ComputerName
+    One or more computer names to query. Defaults to the local machine.
+
+.PARAMETER ExportPath
+    Optional. Full path for CSV export.
+    Example: C:\Reports\SoftwareInventory.csv
+
+.PARAMETER PublisherFilter
+    Optional. Filter results to a specific publisher substring.
+    Example: "Microsoft" returns only Microsoft software.
+
+.PARAMETER ExcludeSystemComponents
+    Switch. Excludes system components and Windows updates from results.
+    Enabled by default for cleaner output.
+
+.PARAMETER NameFilter
+    Optional. Filter results to application names containing this string.
+    Example: "Office" returns all apps with Office in the name.
+
+.EXAMPLE
+    .\Get-SoftwareInventory.ps1
+    Returns all installed software on the local machine.
+
+.EXAMPLE
+    .\Get-SoftwareInventory.ps1 -ComputerName PC01,PC02 -ExportPath C:\Reports\SW.csv
+    Queries two remote machines and exports combined results to CSV.
+
+.EXAMPLE
+    .\Get-SoftwareInventory.ps1 -PublisherFilter "Adobe" -ExportPath C:\Reports\Adobe.csv
+    Returns only Adobe products across the local machine.
+
+.EXAMPLE
+    .\Get-SoftwareInventory.ps1 -ComputerName (Get-Content C:\computers.txt) -ExcludeSystemComponents
+    Runs against a list of machines, excluding system components.
+
+.NOTES
+    Author:     Seth Jones
+    Version:    1.0
+    Requires:   PowerShell 5.1+
+                WinRM enabled on remote targets
+                Local admin rights on target machines
+
+    NOTE:       Registry-based inventory captures installed applications.
+                Some software installed outside the registry (portable apps,
+                some MSI-less installs) will not appear in results.
+#>
+
+[CmdletBinding()]
+param (
+    [Parameter(ValueFromPipeline = $true)]
+    [string[]]$ComputerName = $env:COMPUTERNAME,
+
+    [Parameter()]
+    [string]$ExportPath,
+
+    [Parameter()]
+    [string]$PublisherFilter,
+
+    [Parameter()]
+    [string]$NameFilter,
+
+    [Parameter()]
+    [switch]$ExcludeSystemComponents = $true
+)
+
+Begin {
+    $allResults = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+    Write-Host "`n=== Software Inventory Export ===" -ForegroundColor Cyan
+    Write-Host "Generated  : $(Get-Date -Format 'yyyy-MM-dd HH:mm')" -ForegroundColor Cyan
+    Write-Host "Publisher  : $(if($PublisherFilter){ $PublisherFilter } else { 'All' })"
+    Write-Host "Name Filter: $(if($NameFilter){ $NameFilter } else { 'None' })"
+    Write-Host "Exclude Sys: $ExcludeSystemComponents`n"
+
+    # Registry paths to query — covers 64-bit, 32-bit (WOW), and current user installs
+    $registryPaths = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    )
+}
+
+Process {
+    foreach ($computer in $ComputerName) {
+
+        Write-Host "Querying $computer..." -ForegroundColor Yellow
+
+        # --- Connectivity check ---
+        if ($computer -ne $env:COMPUTERNAME) {
+            if (-not (Test-Connection -ComputerName $computer -Count 1 -Quiet)) {
+                Write-Warning "  $computer : Unreachable — skipping"
+                continue
+            }
+        }
+
+        try {
+            $scriptBlock = {
+                param($regPaths, $excludeSys)
+
+                $software = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+                foreach ($path in $regPaths) {
+
+                    # HKCU paths need special handling on remote machines
+                    # Skip HKCU on remote queries to avoid access issues
+                    if ($path -like 'HKCU:*' -and $env:COMPUTERNAME -ne $using:env:COMPUTERNAME) {
+                        continue
+                    }
+
+                    try {
+                        $keys = Get-ItemProperty -Path $path -ErrorAction SilentlyContinue
+                    }
+                    catch {
+                        continue
+                    }
+
+                    foreach ($key in $keys) {
+
+                        # Skip entries without a display name — not real applications
+                        if ([string]::IsNullOrWhiteSpace($key.DisplayName)) { continue }
+
+                        # Skip system components if requested
+                        if ($excludeSys) {
+                            if ($key.SystemComponent -eq 1) { continue }
+                            if ($key.ParentKeyName) { continue }
+                            if ($key.DisplayName -like 'KB*') { continue }
+                            if ($key.DisplayName -like 'Hotfix*') { continue }
+                            if ($key.DisplayName -like 'Security Update*') { continue }
+                            if ($key.DisplayName -like 'Update for*') { continue }
+                        }
+
+                        # Parse install date — stored as YYYYMMDD string
+                        $installDate = $null
+                        if ($key.InstallDate -match '^\d{8}$') {
+                            try {
+                                $installDate = [datetime]::ParseExact(
+                                    $key.InstallDate, 'yyyyMMdd',
+                                    [System.Globalization.CultureInfo]::InvariantCulture
+                                ).ToString('yyyy-MM-dd')
+                            }
+                            catch { $installDate = $key.InstallDate }
+                        }
+
+                        # Determine architecture from registry path
+                        $arch = if ($path -like '*WOW6432*') { '32-bit' } else { '64-bit' }
+
+                        $software.Add([PSCustomObject]@{
+                            Name            = $key.DisplayName
+                            Version         = $key.DisplayVersion
+                            Publisher       = $key.Publisher
+                            InstallDate     = $installDate
+                            InstallLocation = $key.InstallLocation
+                            Architecture    = $arch
+                            UninstallString = $key.UninstallString
+                        })
+                    }
+                }
+
+                # Deduplicate — same name + version can appear in both 32/64 paths
+                $software | Sort-Object Name, Version -Unique
+            }
+
+            # Run locally or remotely
+            if ($computer -eq $env:COMPUTERNAME) {
+                $softwareList = & $scriptBlock -regPaths $registryPaths -excludeSys $ExcludeSystemComponents
+            }
+            else {
+                $softwareList = Invoke-Command -ComputerName $computer -ScriptBlock $scriptBlock `
+                    -ArgumentList $registryPaths, $ExcludeSystemComponents -ErrorAction Stop
+            }
+
+            # Apply optional filters
+            if ($PublisherFilter) {
+                $softwareList = $softwareList | Where-Object { $_.Publisher -like "*$PublisherFilter*" }
+            }
+            if ($NameFilter) {
+                $softwareList = $softwareList | Where-Object { $_.Name -like "*$NameFilter*" }
+            }
+
+            # Add computer name to each record for fleet-wide exports
+            $enriched = $softwareList | ForEach-Object {
+                [PSCustomObject]@{
+                    ComputerName    = $computer
+                    Name            = $_.Name
+                    Version         = $_.Version
+                    Publisher       = $_.Publisher
+                    InstallDate     = $_.InstallDate
+                    Architecture    = $_.Architecture
+                    InstallLocation = $_.InstallLocation
+                    UninstallString = $_.UninstallString
+                }
+            }
+
+            $allResults.AddRange($enriched)
+
+            Write-Host "  Found $($enriched.Count) application(s)" -ForegroundColor Green
+
+        }
+        catch {
+            Write-Warning "  $computer : $($_.Exception.Message)"
+        }
+    }
+}
+
+End {
+    if ($allResults.Count -eq 0) {
+        Write-Host "`nNo software found matching your criteria." -ForegroundColor Yellow
+        return
+    }
+
+    # --- Console output ---
+    $allResults | Sort-Object ComputerName, Name |
+        Format-Table -AutoSize -Property ComputerName, Name, Version, Publisher, InstallDate, Architecture
+
+    # --- Summary ---
+    Write-Host "--- Summary ---" -ForegroundColor Cyan
+    Write-Host "Total applications found : $($allResults.Count)"
+
+    # Publisher breakdown
+    Write-Host "`n--- Top Publishers ---" -ForegroundColor Cyan
+    $allResults |
+        Where-Object { $_.Publisher } |
+        Group-Object Publisher |
+        Sort-Object Count -Descending |
+        Select-Object -First 10 |
+        ForEach-Object {
+            Write-Host "  $($_.Name.PadRight(45)) : $($_.Count) app(s)"
+        }
+
+    # Flag potentially outdated or vulnerable software
+    $flagged = $allResults | Where-Object {
+        $_.Name -like '*Java*' -or
+        $_.Name -like '*Flash*' -or
+        $_.Name -like '*Silverlight*' -or
+        $_.Name -like '*Reader*' -or
+        $_.Name -like '*VLC*' -or
+        $_.Name -like '*7-Zip*' -or
+        $_.Name -like '*WinRAR*' -or
+        $_.Name -like '*Zoom*'
+    }
+
+    if ($flagged) {
+        Write-Host "`n--- Applications to Review for Currency ---" -ForegroundColor Yellow
+        Write-Host "(These are commonly targeted in vulnerability scans — verify versions are current)" -ForegroundColor DarkGray
+        $flagged | Format-Table -AutoSize -Property ComputerName, Name, Version, Publisher, InstallDate
+    }
+
+    # --- Optional CSV export ---
+    if ($ExportPath) {
+        try {
+            $allResults | Sort-Object ComputerName, Name |
+                Export-Csv -Path $ExportPath -NoTypeInformation -Encoding UTF8
+            Write-Host "Report exported to: $ExportPath" -ForegroundColor Green
+        }
+        catch {
+            Write-Warning "Export failed: $($_.Exception.Message)"
+        }
+    }
+}

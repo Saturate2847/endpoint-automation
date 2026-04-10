@@ -1,0 +1,342 @@
+#Requires -Version 5.1
+<#
+.SYNOPSIS
+    Performs a comprehensive health check on a local or remote Windows endpoint.
+
+.DESCRIPTION
+    Collects and evaluates key health indicators on one or more Windows machines
+    including disk space, memory utilization, CPU load, uptime, Windows version,
+    Defender status, and critical service states. Assigns an overall health status
+    of Healthy, Warning, or Critical based on configurable thresholds.
+
+    Designed for use as a standalone diagnostic tool or as a scheduled RMM
+    automation to surface at-risk endpoints before they generate user complaints.
+
+.PARAMETER ComputerName
+    One or more computer names to check. Defaults to the local machine.
+
+.PARAMETER DiskWarningPct
+    Disk free space percentage below which a Warning is triggered.
+    Defaults to 20.
+
+.PARAMETER DiskCriticalPct
+    Disk free space percentage below which a Critical is triggered.
+    Defaults to 10.
+
+.PARAMETER MemoryWarningPct
+    Memory utilization percentage above which a Warning is triggered.
+    Defaults to 85.
+
+.PARAMETER MemoryCriticalPct
+    Memory utilization percentage above which a Critical is triggered.
+    Defaults to 95.
+
+.PARAMETER UptimeWarningDays
+    Number of days uptime above which a Warning is triggered (pending reboot).
+    Defaults to 14.
+
+.PARAMETER ExportPath
+    Optional. Full path for CSV export.
+    Example: C:\Reports\EndpointHealth.csv
+
+.EXAMPLE
+    .\Get-EndpointHealth.ps1
+    Runs a health check on the local machine with default thresholds.
+
+.EXAMPLE
+    .\Get-EndpointHealth.ps1 -ComputerName PC01,PC02 -ExportPath C:\Reports\Health.csv
+    Checks two remote machines and exports results to CSV.
+
+.EXAMPLE
+    .\Get-EndpointHealth.ps1 -DiskCriticalPct 15 -MemoryWarningPct 80
+    Runs locally with custom thresholds.
+
+.NOTES
+    Author:     Seth Jones
+    Version:    1.0
+    Requires:   PowerShell 5.1+
+                WinRM enabled on remote targets
+                Local admin rights on target machines
+#>
+
+[CmdletBinding()]
+param (
+    [Parameter(ValueFromPipeline = $true)]
+    [string[]]$ComputerName = $env:COMPUTERNAME,
+
+    [Parameter()]
+    [int]$DiskWarningPct = 20,
+
+    [Parameter()]
+    [int]$DiskCriticalPct = 10,
+
+    [Parameter()]
+    [int]$MemoryWarningPct = 85,
+
+    [Parameter()]
+    [int]$MemoryCriticalPct = 95,
+
+    [Parameter()]
+    [int]$UptimeWarningDays = 14,
+
+    [Parameter()]
+    [string]$ExportPath
+)
+
+Begin {
+    $results = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+    Write-Host "`n=== Endpoint Health Check ===" -ForegroundColor Cyan
+    Write-Host "Generated : $(Get-Date -Format 'yyyy-MM-dd HH:mm')`n" -ForegroundColor Cyan
+
+    # Critical services to verify are running
+    $criticalServices = @(
+        'WinDefend',    # Windows Defender
+        'EventLog',     # Windows Event Log
+        'wuauserv',     # Windows Update
+        'Winmgmt'       # WMI
+    )
+}
+
+Process {
+    foreach ($computer in $ComputerName) {
+
+        Write-Host "Checking $computer..." -ForegroundColor Yellow
+        $issues = [System.Collections.Generic.List[string]]::new()
+        $overallStatus = 'Healthy'
+
+        $record = [PSCustomObject]@{
+            ComputerName        = $computer
+            Online              = $false
+            OSVersion           = 'N/A'
+            UptimeDays          = 'N/A'
+            LastBoot            = 'N/A'
+            CPULoadPct          = 'N/A'
+            TotalMemoryGB       = 'N/A'
+            UsedMemoryGB        = 'N/A'
+            MemoryUtilizationPct= 'N/A'
+            SystemDriveFreeGB   = 'N/A'
+            SystemDriveTotalGB  = 'N/A'
+            SystemDriveFreePct  = 'N/A'
+            DefenderEnabled     = 'N/A'
+            DefenderUpdated     = 'N/A'
+            CriticalServices    = 'N/A'
+            OverallStatus       = 'Offline'
+            Issues              = ''
+        }
+
+        # --- Connectivity check ---
+        if (-not (Test-Connection -ComputerName $computer -Count 1 -Quiet)) {
+            $record.Issues = 'Unreachable'
+            $results.Add($record)
+            Write-Warning "  $computer : Unreachable"
+            continue
+        }
+
+        $record.Online = $true
+
+        try {
+            $scriptBlock = {
+                param($critSvcs)
+
+                # --- OS and uptime ---
+                $os       = Get-CimInstance -ClassName Win32_OperatingSystem
+                $uptime   = (Get-Date) - $os.LastBootUpTime
+                $osVer    = "$($os.Caption) (Build $($os.BuildNumber))"
+
+                # --- CPU load (average over 2 samples) ---
+                $cpu1     = (Get-CimInstance -ClassName Win32_Processor).LoadPercentage
+                Start-Sleep -Seconds 2
+                $cpu2     = (Get-CimInstance -ClassName Win32_Processor).LoadPercentage
+                $cpuLoad  = [math]::Round(($cpu1 + $cpu2) / 2, 1)
+
+                # --- Memory ---
+                $totalMem = [math]::Round($os.TotalVisibleMemorySize / 1MB, 2)
+                $freeMem  = [math]::Round($os.FreePhysicalMemory / 1MB, 2)
+                $usedMem  = [math]::Round($totalMem - $freeMem, 2)
+                $memPct   = [math]::Round(($usedMem / $totalMem) * 100, 1)
+
+                # --- System drive (C:) ---
+                $sysDrive = Get-CimInstance -ClassName Win32_LogicalDisk |
+                    Where-Object { $_.DeviceID -eq $env:SystemDrive }
+
+                $driveTotal = [math]::Round($sysDrive.Size / 1GB, 2)
+                $driveFree  = [math]::Round($sysDrive.FreeSpace / 1GB, 2)
+                $driveFreePct = [math]::Round(($driveFree / $driveTotal) * 100, 1)
+
+                # --- Windows Defender ---
+                $defenderStatus = $null
+                $defenderUpdated = $false
+                try {
+                    $mpStatus        = Get-MpComputerStatus -ErrorAction Stop
+                    $defenderStatus  = $mpStatus.AntivirusEnabled
+                    $sigAge          = (Get-Date) - $mpStatus.AntivirusSignatureLastUpdated
+                    $defenderUpdated = $sigAge.TotalDays -le 3
+                }
+                catch {
+                    $defenderStatus  = $false
+                    $defenderUpdated = $false
+                }
+
+                # --- Critical services ---
+                $svcResults = foreach ($svc in $critSvcs) {
+                    $s = Get-Service -Name $svc -ErrorAction SilentlyContinue
+                    if ($s) {
+                        "$svc=$($s.Status)"
+                    } else {
+                        "$svc=NotFound"
+                    }
+                }
+
+                [PSCustomObject]@{
+                    OSVersion        = $osVer
+                    UptimeDays       = [math]::Round($uptime.TotalDays, 1)
+                    LastBoot         = $os.LastBootUpTime.ToString('yyyy-MM-dd HH:mm')
+                    CPULoad          = $cpuLoad
+                    TotalMemGB       = $totalMem
+                    UsedMemGB        = $usedMem
+                    MemPct           = $memPct
+                    DriveTotal       = $driveTotal
+                    DriveFree        = $driveFree
+                    DriveFreePct     = $driveFreePct
+                    DefenderEnabled  = $defenderStatus
+                    DefenderUpdated  = $defenderUpdated
+                    Services         = $svcResults -join ', '
+                }
+            }
+
+            # Run locally or remotely
+            if ($computer -eq $env:COMPUTERNAME) {
+                $data = & $scriptBlock -critSvcs $criticalServices
+            } else {
+                $data = Invoke-Command -ComputerName $computer -ScriptBlock $scriptBlock `
+                    -ArgumentList (,$criticalServices) -ErrorAction Stop
+            }
+
+            # Populate record
+            $record.OSVersion             = $data.OSVersion
+            $record.UptimeDays            = $data.UptimeDays
+            $record.LastBoot              = $data.LastBoot
+            $record.CPULoadPct            = $data.CPULoad
+            $record.TotalMemoryGB         = $data.TotalMemGB
+            $record.UsedMemoryGB          = $data.UsedMemGB
+            $record.MemoryUtilizationPct  = $data.MemPct
+            $record.SystemDriveTotalGB    = $data.DriveTotal
+            $record.SystemDriveFreeGB     = $data.DriveFree
+            $record.SystemDriveFreePct    = $data.DriveFreePct
+            $record.DefenderEnabled       = $data.DefenderEnabled
+            $record.DefenderUpdated       = $data.DefenderUpdated
+            $record.CriticalServices      = $data.Services
+
+            # --- Evaluate thresholds ---
+
+            # Disk
+            if ($data.DriveFreePct -le $DiskCriticalPct) {
+                $issues.Add("CRITICAL: Disk only $($data.DriveFreePct)% free")
+                $overallStatus = 'Critical'
+            } elseif ($data.DriveFreePct -le $DiskWarningPct) {
+                $issues.Add("WARNING: Disk $($data.DriveFreePct)% free")
+                if ($overallStatus -ne 'Critical') { $overallStatus = 'Warning' }
+            }
+
+            # Memory
+            if ($data.MemPct -ge $MemoryCriticalPct) {
+                $issues.Add("CRITICAL: Memory at $($data.MemPct)%")
+                $overallStatus = 'Critical'
+            } elseif ($data.MemPct -ge $MemoryWarningPct) {
+                $issues.Add("WARNING: Memory at $($data.MemPct)%")
+                if ($overallStatus -ne 'Critical') { $overallStatus = 'Warning' }
+            }
+
+            # Uptime
+            if ($data.UptimeDays -gt $UptimeWarningDays) {
+                $issues.Add("WARNING: Uptime $($data.UptimeDays) days — reboot overdue")
+                if ($overallStatus -ne 'Critical') { $overallStatus = 'Warning' }
+            }
+
+            # Defender
+            if (-not $data.DefenderEnabled) {
+                $issues.Add("CRITICAL: Windows Defender disabled")
+                $overallStatus = 'Critical'
+            } elseif (-not $data.DefenderUpdated) {
+                $issues.Add("WARNING: Defender signatures older than 3 days")
+                if ($overallStatus -ne 'Critical') { $overallStatus = 'Warning' }
+            }
+
+            # Stopped critical services
+            foreach ($svcResult in $data.Services -split ', ') {
+                if ($svcResult -match '=Stopped') {
+                    $issues.Add("CRITICAL: Service stopped — $svcResult")
+                    $overallStatus = 'Critical'
+                }
+            }
+
+            $record.OverallStatus = $overallStatus
+            $record.Issues        = if ($issues.Count -gt 0) { $issues -join ' | ' } else { 'None' }
+
+            # Console output per machine
+            $statusColor = switch ($overallStatus) {
+                'Healthy'  { 'Green' }
+                'Warning'  { 'Yellow' }
+                'Critical' { 'Red' }
+                default    { 'White' }
+            }
+
+            Write-Host "  Status   : $overallStatus" -ForegroundColor $statusColor
+            Write-Host "  OS       : $($data.OSVersion)"
+            Write-Host "  Uptime   : $($data.UptimeDays) days (last boot $($data.LastBoot))"
+            Write-Host "  CPU      : $($data.CPULoad)%"
+            Write-Host "  Memory   : $($data.MemPct)% ($($data.UsedMemGB)GB / $($data.TotalMemGB)GB)"
+            Write-Host "  Disk C:  : $($data.DriveFreePct)% free ($($data.DriveFree)GB / $($data.DriveTotal)GB)"
+            Write-Host "  Defender : Enabled=$($data.DefenderEnabled) | Updated=$($data.DefenderUpdated)"
+            if ($issues.Count -gt 0) {
+                Write-Host "  Issues   : $($issues -join ' | ')" -ForegroundColor $statusColor
+            }
+            Write-Host ""
+
+        }
+        catch {
+            $record.Issues        = "Error: $($_.Exception.Message)"
+            $record.OverallStatus = 'Error'
+            Write-Warning "  $computer : $($_.Exception.Message)"
+        }
+
+        $results.Add($record)
+    }
+}
+
+End {
+    # --- Fleet summary ---
+    Write-Host "--- Fleet Summary ---" -ForegroundColor Cyan
+
+    $healthy  = ($results | Where-Object OverallStatus -eq 'Healthy').Count
+    $warning  = ($results | Where-Object OverallStatus -eq 'Warning').Count
+    $critical = ($results | Where-Object OverallStatus -eq 'Critical').Count
+    $offline  = ($results | Where-Object { $_.OverallStatus -eq 'Offline' -or $_.OverallStatus -eq 'Error' }).Count
+
+    Write-Host "  Healthy  : $healthy"  -ForegroundColor Green
+    Write-Host "  Warning  : $warning"  -ForegroundColor Yellow
+    Write-Host "  Critical : $critical" -ForegroundColor Red
+    Write-Host "  Offline  : $offline"  -ForegroundColor DarkGray
+    Write-Host "  Total    : $($results.Count)"
+
+    # Flag any critical machines prominently
+    $criticalMachines = $results | Where-Object OverallStatus -eq 'Critical'
+    if ($criticalMachines) {
+        Write-Host "`n--- Machines Requiring Immediate Attention ---" -ForegroundColor Red
+        $criticalMachines | ForEach-Object {
+            Write-Host "  $($_.ComputerName) : $($_.Issues)" -ForegroundColor Red
+        }
+    }
+
+    # --- Optional CSV export ---
+    if ($ExportPath) {
+        try {
+            $results | Export-Csv -Path $ExportPath -NoTypeInformation -Encoding UTF8
+            Write-Host "`nReport exported to: $ExportPath" -ForegroundColor Green
+        }
+        catch {
+            Write-Warning "Export failed: $($_.Exception.Message)"
+        }
+    }
+}

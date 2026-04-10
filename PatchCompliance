@@ -1,0 +1,214 @@
+#Requires -Version 5.1
+<#
+.SYNOPSIS
+    Evaluates Windows patch compliance on a local endpoint and writes results
+    to NinjaOne custom fields.
+
+.DESCRIPTION
+    Designed for deployment via NinjaOne RMM as a scheduled automation script.
+    Runs locally on each managed endpoint, evaluates patch status, pending
+    updates, and reboot state, then writes structured results to NinjaOne
+    custom device fields for fleet-wide reporting and dashboard visibility.
+
+    Custom fields required in NinjaOne (create these before deploying):
+        patchCompliant      - Checkbox  (true/false)
+        lastPatchDate       - Text      (yyyy-MM-dd)
+        daysSincePatched    - Decimal   (integer value)
+        pendingUpdateCount  - Decimal   (integer value)
+        pendingReboot       - Checkbox  (true/false)
+        patchComplianceNote - Text      (status summary string)
+
+.PARAMETER DaysThreshold
+    Number of days since last patch before flagging as non-compliant.
+    Defaults to 30. Override via NinjaOne script parameter if needed.
+
+.EXAMPLE
+    Deployed via NinjaOne automation — runs silently on endpoint, writes
+    results to custom fields visible in NinjaOne device dashboard and reports.
+
+.NOTES
+    Author:     Seth Jones
+    Version:    1.0
+    Context:    Runs locally on managed endpoint via NinjaOne RMM
+    Requires:   PowerShell 5.1+
+                NinjaOne agent installed (provides Ninja-Property-Set cmdlet)
+                Local admin rights (inherited from NinjaOne agent context)
+#>
+
+[CmdletBinding()]
+param (
+    [Parameter()]
+    [int]$DaysThreshold = 30
+)
+
+# ---------------------------------------------------------------------------
+# HELPER FUNCTION — Write to NinjaOne custom field with fallback logging
+# ---------------------------------------------------------------------------
+function Set-NinjaField {
+    param(
+        [string]$FieldName,
+        $Value
+    )
+    try {
+        Ninja-Property-Set $FieldName $Value
+        Write-Verbose "NinjaField set: $FieldName = $Value"
+    }
+    catch {
+        # Ninja-Property-Set not available (running outside NinjaOne context)
+        # Fall back to console output for local testing
+        Write-Host "  [NinjaField] $FieldName = $Value" -ForegroundColor DarkGray
+    }
+}
+
+# ---------------------------------------------------------------------------
+# MAIN LOGIC
+# ---------------------------------------------------------------------------
+
+Write-Host "=== NinjaOne Patch Compliance Check ===" -ForegroundColor Cyan
+Write-Host "Computer   : $env:COMPUTERNAME"
+Write-Host "Threshold  : $DaysThreshold days"
+Write-Host "Timestamp  : $(Get-Date -Format 'yyyy-MM-dd HH:mm')`n"
+
+$cutoffDate       = (Get-Date).AddDays(-$DaysThreshold)
+$lastPatchDate    = $null
+$pendingCount     = 0
+$pendingReboot    = $false
+$compliant        = $false
+$note             = ''
+
+# ---------------------------------------------------------------------------
+# STEP 1 — Get last successful Windows Update install date
+# ---------------------------------------------------------------------------
+try {
+    Write-Host "Checking Windows Update history..." -ForegroundColor Yellow
+
+    $updateSession  = New-Object -ComObject Microsoft.Update.Session
+    $updateSearcher = $updateSession.CreateUpdateSearcher()
+    $totalHistory   = $updateSearcher.GetTotalHistoryCount()
+
+    if ($totalHistory -gt 0) {
+        $lastSuccess = $updateSearcher.QueryHistory(0, $totalHistory) |
+            Where-Object { $_.ResultCode -eq 2 } |   # 2 = Succeeded
+            Sort-Object Date -Descending |
+            Select-Object -First 1
+
+        if ($lastSuccess) {
+            $lastPatchDate = $lastSuccess.Date
+            Write-Host "  Last successful patch : $($lastPatchDate.ToString('yyyy-MM-dd'))" -ForegroundColor Green
+        }
+        else {
+            Write-Host "  No successful patches found in history." -ForegroundColor Red
+            $note = 'No successful patch history found'
+        }
+    }
+    else {
+        Write-Host "  Windows Update history is empty." -ForegroundColor Red
+        $note = 'Windows Update history empty'
+    }
+}
+catch {
+    Write-Warning "  Failed to query Windows Update history: $($_.Exception.Message)"
+    $note = "WU history error: $($_.Exception.Message)"
+}
+
+# ---------------------------------------------------------------------------
+# STEP 2 — Count pending updates not yet installed
+# ---------------------------------------------------------------------------
+try {
+    Write-Host "Checking for pending updates..." -ForegroundColor Yellow
+
+    $updateSession  = New-Object -ComObject Microsoft.Update.Session
+    $updateSearcher = $updateSession.CreateUpdateSearcher()
+    $searchResult   = $updateSearcher.Search("IsInstalled=0 and Type='Software'")
+    $pendingCount   = $searchResult.Updates.Count
+
+    if ($pendingCount -gt 0) {
+        Write-Host "  Pending updates : $pendingCount" -ForegroundColor Red
+        $note += "$(if($note){'; '})$pendingCount update(s) pending"
+    }
+    else {
+        Write-Host "  Pending updates : None" -ForegroundColor Green
+    }
+}
+catch {
+    Write-Warning "  Failed to check pending updates: $($_.Exception.Message)"
+    $note += "$(if($note){'; '})Pending update check failed"
+}
+
+# ---------------------------------------------------------------------------
+# STEP 3 — Check for pending reboot via registry keys
+# ---------------------------------------------------------------------------
+Write-Host "Checking reboot status..." -ForegroundColor Yellow
+
+$rebootKeys = @(
+    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
+    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired',
+    'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\PendingFileRenameOperations'
+)
+
+foreach ($key in $rebootKeys) {
+    if (Test-Path $key) {
+        $pendingReboot = $true
+        Write-Host "  Reboot pending (key: $key)" -ForegroundColor Red
+        $note += "$(if($note){'; '})Reboot required"
+        break
+    }
+}
+
+if (-not $pendingReboot) {
+    Write-Host "  No pending reboot detected." -ForegroundColor Green
+}
+
+# ---------------------------------------------------------------------------
+# STEP 4 — Evaluate compliance
+# ---------------------------------------------------------------------------
+if ($lastPatchDate -and $lastPatchDate -ge $cutoffDate) {
+    $compliant = $true
+}
+
+$daysSince = if ($lastPatchDate) {
+    [int]((Get-Date) - $lastPatchDate).TotalDays
+} else {
+    9999
+}
+
+if ($compliant -and $pendingCount -eq 0 -and -not $pendingReboot) {
+    $note = 'Compliant — no action required'
+}
+elseif (-not $compliant) {
+    $note = "$(if($note){$note + '; '})Not patched within $DaysThreshold-day threshold"
+}
+
+# ---------------------------------------------------------------------------
+# STEP 5 — Write results to NinjaOne custom fields
+# ---------------------------------------------------------------------------
+Write-Host "`nWriting results to NinjaOne custom fields..." -ForegroundColor Yellow
+
+Set-NinjaField -FieldName 'patchCompliant'      -Value $compliant
+Set-NinjaField -FieldName 'lastPatchDate'       -Value (if ($lastPatchDate) { $lastPatchDate.ToString('yyyy-MM-dd') } else { 'Unknown' })
+Set-NinjaField -FieldName 'daysSincePatched'    -Value $daysSince
+Set-NinjaField -FieldName 'pendingUpdateCount'  -Value $pendingCount
+Set-NinjaField -FieldName 'pendingReboot'       -Value $pendingReboot
+Set-NinjaField -FieldName 'patchComplianceNote' -Value $note
+
+# ---------------------------------------------------------------------------
+# STEP 6 — Console summary (visible in NinjaOne script activity log)
+# ---------------------------------------------------------------------------
+Write-Host "`n--- Compliance Summary ---" -ForegroundColor Cyan
+Write-Host "Computer         : $env:COMPUTERNAME"
+Write-Host "Last Patch Date  : $(if($lastPatchDate){$lastPatchDate.ToString('yyyy-MM-dd')}else{'Unknown'})"
+Write-Host "Days Since Patch : $daysSince"
+Write-Host "Pending Updates  : $pendingCount"
+Write-Host "Pending Reboot   : $pendingReboot"
+Write-Host "Compliant        : $compliant"
+Write-Host "Note             : $note"
+
+# Exit with non-zero code if non-compliant so NinjaOne can alert on failure
+if (-not $compliant -or $pendingReboot) {
+    Write-Host "`nResult: NON-COMPLIANT" -ForegroundColor Red
+    exit 1
+}
+else {
+    Write-Host "`nResult: COMPLIANT" -ForegroundColor Green
+    exit 0
+}

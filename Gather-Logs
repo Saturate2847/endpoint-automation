@@ -1,0 +1,623 @@
+$Parameter = $args[0]
+
+Write-Host ""
+Write-Host $Parameter
+Write-Host ""
+
+$outputDir = "C:\TempDeploy\Logs"
+
+function Ensure-LogDir {
+    if (-not (Test-Path -Path $outputDir)) {
+        New-Item -Path $outputDir -ItemType Directory -Force | Out-Null
+    }
+}
+
+##################################################################
+
+function WindowsUpgradeLogs {
+    Ensure-LogDir
+
+    $sourcePath = 'C:\$WINDOWS.~BT\Sources\Panther\setuperr.log'
+    $destinationPath = "$outputDir\setuperr.log"
+
+    if (Test-Path $sourcePath) {
+        Copy-Item -Path $sourcePath -Destination $destinationPath -Force
+        Write-Host "setuperr.log copied successfully."
+    } else {
+        Write-Host "Source file not found: $sourcePath"
+    }
+}
+
+##################################################################
+
+function NinjaStreamerPlayerLogs {
+    Ensure-LogDir
+
+    $loggedInUser     = (Get-CimInstance -Class Win32_ComputerSystem).UserName
+    $loggedInUserName = $loggedInUser.Split('\')[-1]
+
+    $ncStreamerDir = "C:\Windows\Temp"
+    $ncPlayerDir   = "C:\Users\$loggedInUserName\AppData\Local\Temp"
+
+    $timeThreshold = (Get-Date).AddHours(-24)
+
+    function Get-LogFilesAndZip {
+        param (
+            [string]$sourceDir,
+            [string]$pattern,
+            [string]$zipName
+        )
+
+        $logFiles = Get-ChildItem -Path $sourceDir -Filter $pattern -ErrorAction SilentlyContinue |
+            Where-Object { $_.LastWriteTime -ge $timeThreshold }
+
+        if ($logFiles.Count -gt 0) {
+            $zipFilePath = Join-Path -Path $outputDir -ChildPath $zipName
+            $tempDir     = Join-Path -Path $env:TEMP -ChildPath "tempZip_Ninja_$(Get-Random)"
+
+            New-Item -Path $tempDir -ItemType Directory -Force | Out-Null
+            try {
+                $logFiles | ForEach-Object { Copy-Item -Path $_.FullName -Destination $tempDir }
+                Compress-Archive -Path "$tempDir\*" -DestinationPath $zipFilePath -Force
+                Write-Host "Files zipped successfully: $zipFilePath"
+            } finally {
+                Remove-Item -Path $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        } else {
+            Write-Host "No files matching '$pattern' in '$sourceDir' within the last 24 hours."
+        }
+    }
+
+    Get-LogFilesAndZip -sourceDir $ncStreamerDir -pattern "NCStreamer*" -zipName "NCStreamerLogs.zip"
+    Get-LogFilesAndZip -sourceDir $ncPlayerDir   -pattern "NCplayer*"  -zipName "NCPlayerLogs.zip"
+
+    Write-Host "Process completed."
+}
+
+##################################################################
+
+function EventViewerLogs {
+    Ensure-LogDir
+
+    $timeThreshold = (Get-Date).AddHours(-24)
+    $channels      = @("Application", "System", "Security")
+
+    $tempDir = Join-Path -Path $env:TEMP -ChildPath "tempZip_EventViewer_$(Get-Random)"
+    New-Item -Path $tempDir -ItemType Directory -Force | Out-Null
+
+    try {
+        $anyFiles = $false
+
+        foreach ($channel in $channels) {
+            Write-Host "Collecting $channel events since $timeThreshold"
+            $events = $null
+
+            try {
+                $events = Get-WinEvent -FilterHashtable @{ LogName = $channel; StartTime = $timeThreshold } -ErrorAction Stop
+            } catch {
+                Write-Host "FilterHashtable failed for $channel, falling back to simple filter"
+                try {
+                    $events = Get-WinEvent -LogName $channel -ErrorAction Stop |
+                        Where-Object { $_.TimeCreated -ge $timeThreshold }
+                } catch {
+                    Write-Host "Could not read $channel. Error: $_"
+                    continue
+                }
+            }
+
+            if ($events -and $events.Count -gt 0) {
+                $logFilePath = Join-Path -Path $tempDir -ChildPath "EventViewerLogs_$channel.txt"
+                $events | Format-List * | Out-String -Width 32767 | Out-File -FilePath $logFilePath -Encoding utf8
+                Write-Host "Exported $($events.Count) events from $channel"
+                $anyFiles = $true
+            } else {
+                Write-Host "No events found in $channel since $timeThreshold"
+            }
+        }
+
+        if ($anyFiles) {
+            $zipFilePath = "$outputDir\EventViewerLogs_Channels.zip"
+            Compress-Archive -Path "$tempDir\*" -DestinationPath $zipFilePath -Force
+            Write-Host "EventViewer logs zipped successfully: $zipFilePath"
+        } else {
+            Write-Host "No events collected. Skipping zip."
+        }
+    } finally {
+        Remove-Item -Path $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+##################################################################
+
+function CriticalErrorEventViewerLogs {
+    Ensure-LogDir
+
+    $timeThreshold = (Get-Date).AddHours(-24)
+    $channels      = @("Application", "System", "Security")
+    $allEvents     = @()
+
+    foreach ($channel in $channels) {
+        try {
+            $events = Get-WinEvent -FilterHashtable @{ LogName = $channel; StartTime = $timeThreshold } -ErrorAction Stop
+            if ($events) {
+                $allEvents += $events | Where-Object { $_.LevelDisplayName -match "Critical|Error" }
+            }
+        } catch {
+            Write-Host "Could not read $channel. Error: $_"
+        }
+    }
+
+    if ($allEvents.Count -gt 0) {
+        $tempDir = Join-Path -Path $env:TEMP -ChildPath "tempZip_EventCrit_$(Get-Random)"
+        New-Item -Path $tempDir -ItemType Directory -Force | Out-Null
+
+        try {
+            $logFilePath = Join-Path -Path $tempDir -ChildPath "CriticalErrorEventViewerLogs.txt"
+            $allEvents | Format-List * | Out-String -Width 32767 | Out-File -FilePath $logFilePath -Encoding utf8
+
+            $zipFilePath = "$outputDir\CriticalErrorEventViewerLogs.zip"
+            Compress-Archive -Path "$tempDir\*" -DestinationPath $zipFilePath -Force
+            Write-Host "Critical/Error EventViewer logs zipped successfully: $zipFilePath ($($allEvents.Count) events)"
+        } finally {
+            Remove-Item -Path $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    } else {
+        Write-Host "No Critical/Error EventViewer logs found in the past 24 hours."
+    }
+}
+
+##################################################################
+
+function WindowsUpdateLogs {
+    Ensure-LogDir
+
+    try {
+        Copy-Item -Path "C:\Windows\Logs\CBS\CBS.log" -Destination "$outputDir\CBS.log" -Force -ErrorAction Stop
+        Write-Host "CBS.log copied to $outputDir"
+    } catch {
+        Write-Host "Failed to copy CBS.log: $($_.Exception.Message)"
+    }
+
+    try {
+        Get-WinEvent -LogName "Microsoft-Windows-WindowsUpdateClient/Operational" -MaxEvents 200 -ErrorAction Stop |
+            Export-Clixml -Path "$outputDir\WUClientEvents.xml"
+        Write-Host "Windows Update event log exported to WUClientEvents.xml"
+    } catch {
+        Write-Host "Failed to export Windows Update event log: $($_.Exception.Message)"
+    }
+
+    $setupLog = 'C:\$WINDOWS.~BT\Sources\Panther\setupact.log'
+    if (Test-Path $setupLog) {
+        try {
+            Copy-Item -Path $setupLog -Destination "$outputDir\setupact.log" -Force -ErrorAction Stop
+            Write-Host "setupact.log copied to $outputDir"
+        } catch {
+            Write-Host "Failed to copy setupact.log: $($_.Exception.Message)"
+        }
+    }
+}
+
+##################################################################
+
+function CorruptionLog {
+    Ensure-LogDir
+
+    $logFilePath = "$outputDir\SFC_CorruptionSummary.log"
+    $cbsLog      = "$env:windir\Logs\CBS\CBS.log"
+
+    Write-Host "Running System File Checker (this may take several minutes)..."
+    sfc /scannow | Out-Null
+
+    Write-Host "Parsing CBS.log for corruption results..."
+
+    $corruptionEntries = Select-String -Path $cbsLog -Pattern "corrupt", "cannot repair", "repair completed" -SimpleMatch |
+        Where-Object { $_.Line -match "Repair|corrupt" }
+
+    if ($corruptionEntries) {
+        $corruptionEntries | ForEach-Object { $_.Line } |
+            Out-File -FilePath $logFilePath -Encoding UTF8 -Force
+        Write-Host "Corruption summary saved to: $logFilePath"
+    } else {
+        "No corruption entries found in CBS.log after scan." |
+            Out-File -FilePath $logFilePath -Encoding UTF8 -Force
+        Write-Host "No corruption found."
+    }
+}
+
+##################################################################
+
+function NetworkDiagLogs {
+    Ensure-LogDir
+
+    $logFilePath = "$outputDir\NetworkDiag.txt"
+    $output      = [System.Text.StringBuilder]::new()
+
+    $sections = [ordered]@{
+        "IP CONFIGURATION"          = { ipconfig /all }
+        "ROUTING TABLE"             = { route print }
+        "ARP CACHE"                 = { arp -a }
+        "ACTIVE CONNECTIONS"        = { netstat -ano }
+        "DNS CACHE"                 = { Get-DnsClientCache | Format-Table -AutoSize | Out-String -Width 32767 }
+        "NETWORK ADAPTERS"          = { Get-NetAdapter | Format-Table Name, InterfaceDescription, Status, LinkSpeed, MacAddress -AutoSize | Out-String -Width 32767 }
+        "IP ADDRESSES"              = { Get-NetIPAddress | Format-Table InterfaceAlias, AddressFamily, IPAddress, PrefixLength, Type -AutoSize | Out-String -Width 32767 }
+        "DNS CLIENT SERVERS"        = { Get-DnsClientServerAddress | Format-Table -AutoSize | Out-String -Width 32767 }
+        "FIREWALL PROFILES"         = { Get-NetFirewallProfile | Format-Table Name, Enabled, DefaultInboundAction, DefaultOutboundAction -AutoSize | Out-String -Width 32767 }
+        "NETWORK CONNECTIVITY TEST" = { Test-NetConnection -ComputerName 8.8.8.8 -InformationLevel Detailed | Out-String -Width 32767 }
+    }
+
+    foreach ($section in $sections.Keys) {
+        $null = $output.AppendLine("=" * 60)
+        $null = $output.AppendLine($section)
+        $null = $output.AppendLine("=" * 60)
+        try {
+            $result = & $sections[$section]
+            $null = $output.AppendLine(($result | Out-String))
+        } catch {
+            $null = $output.AppendLine("ERROR: $($_.Exception.Message)")
+        }
+        $null = $output.AppendLine()
+    }
+
+    $output.ToString() | Out-File -FilePath $logFilePath -Encoding utf8 -Force
+    Write-Host "Network diagnostics saved to: $logFilePath"
+}
+
+##################################################################
+
+function BSODMinidumps {
+    Ensure-LogDir
+
+    $minidumpPath = "C:\Windows\Minidump"
+    $memoryDump   = "C:\Windows\MEMORY.DMP"
+
+    $tempDir = Join-Path -Path $env:TEMP -ChildPath "tempZip_BSOD_$(Get-Random)"
+    New-Item -Path $tempDir -ItemType Directory -Force | Out-Null
+
+    try {
+        $anyFiles = $false
+
+        if (Test-Path $minidumpPath) {
+            $dumps = Get-ChildItem -Path $minidumpPath -Filter "*.dmp" -ErrorAction SilentlyContinue
+            if ($dumps.Count -gt 0) {
+                $dumps | ForEach-Object { Copy-Item -Path $_.FullName -Destination $tempDir -Force }
+                Write-Host "Copied $($dumps.Count) minidump file(s)."
+                $anyFiles = $true
+            } else {
+                Write-Host "No minidump files found in $minidumpPath"
+            }
+        } else {
+            Write-Host "Minidump directory not found: $minidumpPath"
+        }
+
+        # Collect BSOD-related events from System log (BugCheck = Event ID 1001)
+        try {
+            $bsodEvents = Get-WinEvent -FilterHashtable @{ LogName = "System"; Id = 1001 } -ErrorAction Stop
+            if ($bsodEvents) {
+                $bsodEvents | Format-List * | Out-String -Width 32767 |
+                    Out-File -FilePath "$tempDir\BSOD_Events.txt" -Encoding utf8 -Force
+                Write-Host "Exported $($bsodEvents.Count) BSOD event(s) from System log."
+                $anyFiles = $true
+            }
+        } catch {
+            Write-Host "No BSOD events (ID 1001) found in System log."
+        }
+
+        if (Test-Path $memoryDump) {
+            $dumpInfo = Get-Item $memoryDump
+            "Memory dump found: $memoryDump`nSize: $([math]::Round($dumpInfo.Length / 1MB, 2)) MB`nLast Modified: $($dumpInfo.LastWriteTime)" |
+                Out-File -FilePath "$tempDir\MEMORY_DMP_Info.txt" -Encoding utf8 -Force
+            Write-Host "Memory dump info noted (file not copied due to size)."
+            $anyFiles = $true
+        }
+
+        if ($anyFiles) {
+            $zipFilePath = "$outputDir\BSODMinidumps.zip"
+            Compress-Archive -Path "$tempDir\*" -DestinationPath $zipFilePath -Force
+            Write-Host "BSOD data zipped successfully: $zipFilePath"
+        } else {
+            Write-Host "No BSOD data found."
+        }
+    } finally {
+        Remove-Item -Path $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+##################################################################
+
+function AppCrashLogs {
+    Ensure-LogDir
+
+    $werPaths = @(
+        "C:\ProgramData\Microsoft\Windows\WER\ReportArchive",
+        "C:\ProgramData\Microsoft\Windows\WER\ReportQueue",
+        "$env:LOCALAPPDATA\Microsoft\Windows\WER\ReportArchive",
+        "$env:LOCALAPPDATA\Microsoft\Windows\WER\ReportQueue"
+    )
+
+    $tempDir = Join-Path -Path $env:TEMP -ChildPath "tempZip_AppCrash_$(Get-Random)"
+    New-Item -Path $tempDir -ItemType Directory -Force | Out-Null
+
+    try {
+        $anyFiles  = $false
+        $threshold = (Get-Date).AddDays(-7)
+
+        foreach ($werPath in $werPaths) {
+            if (-not (Test-Path $werPath)) { continue }
+
+            $reports = Get-ChildItem -Path $werPath -Directory -ErrorAction SilentlyContinue |
+                Where-Object { $_.LastWriteTime -ge $threshold }
+
+            foreach ($report in $reports) {
+                $destDir = Join-Path -Path $tempDir -ChildPath $report.Name
+                Copy-Item -Path $report.FullName -Destination $destDir -Recurse -Force -ErrorAction SilentlyContinue
+                $anyFiles = $true
+            }
+        }
+
+        # Also pull Application Error events (Event ID 1000) from the last 7 days
+        try {
+            $appErrors = Get-WinEvent -FilterHashtable @{
+                LogName   = "Application"
+                Id        = 1000
+                StartTime = $threshold
+            } -ErrorAction Stop
+
+            if ($appErrors) {
+                $appErrors | Format-List * | Out-String -Width 32767 |
+                    Out-File -FilePath "$tempDir\AppError_Events.txt" -Encoding utf8 -Force
+                Write-Host "Exported $($appErrors.Count) Application Error event(s)."
+                $anyFiles = $true
+            }
+        } catch {
+            Write-Host "No Application Error events (ID 1000) found in the last 7 days."
+        }
+
+        if ($anyFiles) {
+            $zipFilePath = "$outputDir\AppCrashLogs.zip"
+            Compress-Archive -Path "$tempDir\*" -DestinationPath $zipFilePath -Force
+            Write-Host "App crash logs zipped successfully: $zipFilePath"
+        } else {
+            Write-Host "No app crash data found in the last 7 days."
+        }
+    } finally {
+        Remove-Item -Path $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+##################################################################
+
+function DiskHealthLogs {
+    Ensure-LogDir
+
+    $logFilePath = "$outputDir\DiskHealth.txt"
+    $output      = [System.Text.StringBuilder]::new()
+
+    $sections = [ordered]@{
+        "PHYSICAL DISK HEALTH" = {
+            Get-PhysicalDisk | Format-List FriendlyName, SerialNumber, MediaType, OperationalStatus, HealthStatus, Size, BusType |
+                Out-String -Width 32767
+        }
+        "LOGICAL DISK USAGE" = {
+            Get-PSDrive -PSProvider FileSystem | Format-Table Name, Root, Used, Free, @{
+                Name       = "TotalGB"
+                Expression = { [math]::Round(($_.Used + $_.Free) / 1GB, 2) }
+            }, @{
+                Name       = "FreeGB"
+                Expression = { [math]::Round($_.Free / 1GB, 2) }
+            }, @{
+                Name       = "UsedPct"
+                Expression = {
+                    $total = $_.Used + $_.Free
+                    if ($total -gt 0) { "{0:N1}%" -f (($_.Used / $total) * 100) } else { "N/A" }
+                }
+            } -AutoSize | Out-String -Width 32767
+        }
+        "VOLUME INFORMATION" = {
+            Get-Volume | Format-Table DriveLetter, FileSystemLabel, FileSystem, DriveType, HealthStatus, SizeRemaining, Size -AutoSize |
+                Out-String -Width 32767
+        }
+        "DISK PARTITIONS" = {
+            Get-Partition | Format-Table DiskNumber, PartitionNumber, DriveLetter, Size, Type, IsActive, IsBoot -AutoSize |
+                Out-String -Width 32767
+        }
+        "STORAGE ERRORS (last 24h)" = {
+            $threshold = (Get-Date).AddHours(-24)
+            try {
+                Get-WinEvent -FilterHashtable @{ LogName = "System"; ProviderName = "disk"; StartTime = $threshold } -ErrorAction Stop |
+                    Format-List * | Out-String -Width 32767
+            } catch {
+                "No disk errors in System log in the last 24 hours."
+            }
+        }
+    }
+
+    foreach ($section in $sections.Keys) {
+        $null = $output.AppendLine("=" * 60)
+        $null = $output.AppendLine($section)
+        $null = $output.AppendLine("=" * 60)
+        try {
+            $result = & $sections[$section]
+            $null = $output.AppendLine(($result | Out-String))
+        } catch {
+            $null = $output.AppendLine("ERROR: $($_.Exception.Message)")
+        }
+        $null = $output.AppendLine()
+    }
+
+    $output.ToString() | Out-File -FilePath $logFilePath -Encoding utf8 -Force
+    Write-Host "Disk health report saved to: $logFilePath"
+}
+
+##################################################################
+
+function ProblemDeviceLogs {
+    Ensure-LogDir
+
+    $logFilePath = "$outputDir\ProblemDevices.txt"
+    $output      = [System.Text.StringBuilder]::new()
+
+    # Devices with a non-OK status
+    $problemDevices = Get-PnpDevice | Where-Object { $_.Status -ne "OK" } | Sort-Object Status, Class
+
+    $null = $output.AppendLine("PROBLEM DEVICES REPORT")
+    $null = $output.AppendLine("Generated: $(Get-Date)")
+    $null = $output.AppendLine("=" * 60)
+    $null = $output.AppendLine()
+
+    if ($problemDevices) {
+        $null = $output.AppendLine("DEVICES WITH ERRORS OR WARNINGS ($($problemDevices.Count) found):")
+        $null = $output.AppendLine()
+        $null = $output.AppendLine(($problemDevices | Format-Table Status, Class, FriendlyName, InstanceId -AutoSize | Out-String -Width 32767))
+
+        $null = $output.AppendLine()
+        $null = $output.AppendLine("DETAIL:")
+        foreach ($device in $problemDevices) {
+            $null = $output.AppendLine("-" * 40)
+            $null = $output.AppendLine("Name   : $($device.FriendlyName)")
+            $null = $output.AppendLine("Status : $($device.Status)")
+            $null = $output.AppendLine("Class  : $($device.Class)")
+            $null = $output.AppendLine("ID     : $($device.InstanceId)")
+            $null = $output.AppendLine()
+        }
+    } else {
+        $null = $output.AppendLine("No problem devices found. All devices report OK status.")
+    }
+
+    # Pull device-related errors from System event log (last 24h)
+    $null = $output.AppendLine("=" * 60)
+    $null = $output.AppendLine("DEVICE EVENTS (System Log, last 24h, Error/Warning only):")
+    $null = $output.AppendLine("=" * 60)
+
+    try {
+        $deviceEvents = Get-WinEvent -FilterHashtable @{
+            LogName   = "System"
+            StartTime = (Get-Date).AddHours(-24)
+            Level     = @(1, 2, 3)  # Critical, Error, Warning
+        } -ErrorAction Stop | Where-Object { $_.ProviderName -match "PnP|driver|device|ACPI" }
+
+        if ($deviceEvents) {
+            $null = $output.AppendLine(($deviceEvents | Format-List TimeCreated, Id, LevelDisplayName, ProviderName, Message | Out-String -Width 32767))
+        } else {
+            $null = $output.AppendLine("No device-related errors/warnings in the last 24 hours.")
+        }
+    } catch {
+        $null = $output.AppendLine("Could not query device events: $($_.Exception.Message)")
+    }
+
+    $output.ToString() | Out-File -FilePath $logFilePath -Encoding utf8 -Force
+    Write-Host "Problem device report saved to: $logFilePath"
+
+    if ($problemDevices) {
+        Write-Host "WARNING: $($problemDevices.Count) device(s) with non-OK status found."
+    }
+}
+
+##################################################################
+
+function SystemInfoLogs {
+    Ensure-LogDir
+
+    $logFilePath = "$outputDir\SystemInfo.txt"
+    $output      = [System.Text.StringBuilder]::new()
+
+    $null = $output.AppendLine("SYSTEM INFORMATION REPORT")
+    $null = $output.AppendLine("Generated: $(Get-Date)")
+    $null = $output.AppendLine("=" * 60)
+    $null = $output.AppendLine()
+
+    $sections = [ordered]@{
+        "OS & COMPUTER INFO" = {
+            $cs = Get-CimInstance Win32_ComputerSystem
+            $os = Get-CimInstance Win32_OperatingSystem
+            $bios = Get-CimInstance Win32_BIOS
+            [PSCustomObject]@{
+                ComputerName    = $cs.Name
+                Manufacturer    = $cs.Manufacturer
+                Model           = $cs.Model
+                TotalRAM_GB     = [math]::Round($cs.TotalPhysicalMemory / 1GB, 2)
+                OSName          = $os.Caption
+                OSVersion       = $os.Version
+                OSBuildNumber   = $os.BuildNumber
+                OSArchitecture  = $os.OSArchitecture
+                InstallDate     = $os.InstallDate
+                LastBootUpTime  = $os.LastBootUpTime
+                Uptime          = (Get-Date) - $os.LastBootUpTime
+                BIOSVersion     = $bios.SMBIOSBIOSVersion
+                SerialNumber    = $bios.SerialNumber
+            } | Format-List | Out-String -Width 32767
+        }
+        "CPU" = {
+            Get-CimInstance Win32_Processor |
+                Format-List Name, NumberOfCores, NumberOfLogicalProcessors, MaxClockSpeed, CurrentClockSpeed, LoadPercentage |
+                Out-String -Width 32767
+        }
+        "RAM MODULES" = {
+            Get-CimInstance Win32_PhysicalMemory |
+                Format-Table BankLabel, Capacity, Speed, Manufacturer, PartNumber -AutoSize |
+                Out-String -Width 32767
+        }
+        "INSTALLED HOTFIXES (last 90 days)" = {
+            $threshold = (Get-Date).AddDays(-90)
+            Get-HotFix | Where-Object { $_.InstalledOn -ge $threshold } |
+                Sort-Object InstalledOn -Descending |
+                Format-Table HotFixID, Description, InstalledOn, InstalledBy -AutoSize |
+                Out-String -Width 32767
+        }
+        "LOCAL USERS" = {
+            Get-LocalUser | Format-Table Name, Enabled, LastLogon, PasswordLastSet, PasswordRequired -AutoSize |
+                Out-String -Width 32767
+        }
+        "STARTUP PROGRAMS" = {
+            Get-CimInstance Win32_StartupCommand |
+                Format-Table Name, Command, Location, User -AutoSize |
+                Out-String -Width 32767
+        }
+        "RUNNING SERVICES (non-MS)" = {
+            Get-Service | Where-Object { $_.Status -eq "Running" } |
+                Sort-Object DisplayName |
+                Format-Table DisplayName, Name, Status, StartType -AutoSize |
+                Out-String -Width 32767
+        }
+        "FAILED SERVICES" = {
+            Get-Service | Where-Object { $_.StartType -ne "Disabled" -and $_.Status -ne "Running" -and $_.StartType -eq "Automatic" } |
+                Format-Table DisplayName, Name, Status, StartType -AutoSize |
+                Out-String -Width 32767
+        }
+        "ENVIRONMENT VARIABLES" = {
+            [System.Environment]::GetEnvironmentVariables("Machine") |
+                Out-String -Width 32767
+        }
+    }
+
+    foreach ($section in $sections.Keys) {
+        $null = $output.AppendLine("=" * 60)
+        $null = $output.AppendLine($section)
+        $null = $output.AppendLine("=" * 60)
+        try {
+            $result = & $sections[$section]
+            $null = $output.AppendLine(($result | Out-String))
+        } catch {
+            $null = $output.AppendLine("ERROR: $($_.Exception.Message)")
+        }
+        $null = $output.AppendLine()
+    }
+
+    $output.ToString() | Out-File -FilePath $logFilePath -Encoding utf8 -Force
+    Write-Host "System info report saved to: $logFilePath"
+}
+
+##################################################################
+
+# Execution based on parameter
+if ($Parameter -eq "Logs-Windows-Upgrade")     { WindowsUpgradeLogs }
+if ($Parameter -eq "Logs-NinjaStreamerPlayer")  { NinjaStreamerPlayerLogs }
+if ($Parameter -eq "Logs-EventViewer")          { EventViewerLogs }
+if ($Parameter -eq "Logs-EventViewer-Critical") { CriticalErrorEventViewerLogs }
+if ($Parameter -eq "Logs-Windows-Update")       { WindowsUpdateLogs }
+if ($Parameter -eq "Logs-Corruption")           { CorruptionLog }
+if ($Parameter -eq "Logs-Network-Diag")         { NetworkDiagLogs }
+if ($Parameter -eq "Logs-BSOD-Minidumps")       { BSODMinidumps }
+if ($Parameter -eq "Logs-App-Crashes")          { AppCrashLogs }
+if ($Parameter -eq "Logs-Disk-Health")          { DiskHealthLogs }
+if ($Parameter -eq "Logs-Problem-Devices")      { ProblemDeviceLogs }
+if ($Parameter -eq "Logs-System-Info")          { SystemInfoLogs }
